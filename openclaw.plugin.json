@@ -1,0 +1,69 @@
+{
+  "id": "d33pmemory",
+  "name": "d33pmemory",
+  "description": "Automatic memory ingest & recall via d33pmemory API. Agents remember everything without needing to be told.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiUrl": {
+        "type": "string",
+        "description": "d33pmemory API base URL",
+        "default": "https://api.d33pmemory.com"
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Your d33pmemory API key (dm_xxx)"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Default agent name to use for ingest/recall"
+      },
+      "autoIngest": {
+        "type": "boolean",
+        "description": "Automatically ingest every conversation turn",
+        "default": true
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "description": "Automatically recall memories on session bootstrap",
+        "default": true
+      },
+      "recallQuery": {
+        "type": "string",
+        "description": "Default recall query for auto-recall (uses recent context if empty)"
+      },
+      "recallMaxResults": {
+        "type": "number",
+        "description": "Max memories to inject on auto-recall",
+        "default": 10,
+        "minimum": 1,
+        "maximum": 50
+      },
+      "recallMinConfidence": {
+        "type": "number",
+        "description": "Minimum confidence for auto-recalled memories",
+        "default": 0.3,
+        "minimum": 0,
+        "maximum": 1
+      },
+      "source": {
+        "type": "string",
+        "description": "Source channel label for ingested interactions",
+        "default": "openclaw"
+      }
+    },
+    "required": ["apiKey"]
+  },
+  "uiHints": {
+    "apiKey": { "label": "API Key", "sensitive": true, "placeholder": "dm_..." },
+    "apiUrl": { "label": "API URL", "placeholder": "https://api.d33pmemory.com" },
+    "agentId": { "label": "Agent Name", "placeholder": "my-agent" },
+    "autoIngest": { "label": "Auto-Ingest" },
+    "autoRecall": { "label": "Auto-Recall" },
+    "recallMaxResults": { "label": "Max Recall Results" },
+    "recallMinConfidence": { "label": "Min Confidence" },
+    "source": { "label": "Source Channel" }
+  }
+}
