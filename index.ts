@@ -5,12 +5,13 @@
  * so AI agents remember everything without being told to.
  *
  * Hooks:
- *   - message:sent    → auto-ingest conversation into d33pmemory
+ *   - agent_end       → auto-ingest conversation into d33pmemory
+ *   - before_agent_start → track sessionKey for the turn
  *   - agent:bootstrap → auto-recall relevant memories into context
  *
- * Tool:
- *   - d33pmemory_recall → manual semantic memory search
- *   - d33pmemory_ingest → manual memory ingestion
+ * Tools:
+ *   - d33pmemory_recall  → manual semantic memory search
+ *   - d33pmemory_ingest  → manual memory ingestion
  */
 
 // ── Types ─────────────────────────────────────────────
@@ -76,7 +77,9 @@ function createClient(config: PluginConfig) {
       userMessage: string,
       agentResponse: string,
       agentId?: string,
-      source?: string
+      source?: string,
+      customId?: string,
+      metadata?: Record<string, string | number | boolean>
     ) {
       return request<{
         interaction_id: string;
@@ -92,6 +95,8 @@ function createClient(config: PluginConfig) {
         agent_response: agentResponse,
         ...(agentId ? { agent_id: agentId } : {}),
         source: source || config.source || "openclaw",
+        ...(customId ? { custom_id: customId } : {}),
+        ...(metadata ? { metadata } : {}),
       });
     },
 
@@ -114,6 +119,33 @@ function createClient(config: PluginConfig) {
       });
     },
   };
+}
+
+// ── Session Key Derivation ─────────────────────────────
+
+/**
+ * Derives a safe, unique agent name from a session key.
+ * sessionKey format: agent:<workspace-name>:<channel>:<account>:<conversation>
+ * Example: agent:dm-agent:telegram:dm-agent-bot:direct:176654117
+ * → workspace: dm-agent
+ * → agent: dm-agent
+ *
+ * This lets each agent/workspace namespace its memories even if they
+ * share the same d33pmemory API key.
+ */
+function deriveAgentFromSessionKey(sessionKey: string): string {
+  const parts = sessionKey.split(":");
+  // parts[0] = "agent", parts[1] = workspace/agent name
+  return parts[1] || "unknown";
+}
+
+function buildMemoryCustomId(sessionKey: string): string {
+  // Sanitize for use as a d33pmemory custom_id
+  return sessionKey
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "")
+    .slice(0, 200); // stay within reasonable length
 }
 
 // ── Memory Formatter ──────────────────────────────────
@@ -141,22 +173,22 @@ function formatMemoriesForContext(memories: RecalledMemory[]): string {
 
 // ── Recent message buffer for ingest ──────────────────
 
-// We need to pair inbound messages with outbound responses.
-// Store the last inbound message per session, then ingest when we see the response.
+// Store the last user message and session key per session for pairing
+// with the agent's response on agent_end.
 
-const pendingInbound = new Map<
-  string,
-  { content: string; timestamp: number }
->();
+interface PendingTurn {
+  content: string;
+  timestamp: number;
+}
 
-// Clean up old entries every 5 minutes
+const pendingTurns = new Map<string, PendingTurn>();
 const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 function cleanPending() {
   const now = Date.now();
-  for (const [key, val] of pendingInbound) {
+  for (const [key, val] of pendingTurns) {
     if (now - val.timestamp > PENDING_TTL_MS) {
-      pendingInbound.delete(key);
+      pendingTurns.delete(key);
     }
   }
 }
@@ -175,82 +207,109 @@ export default function register(api: any) {
   }
 
   const client = createClient(pluginConfig);
-  const agentId = pluginConfig.agentId;
-  const autoIngest = pluginConfig.autoIngest !== false; // default true
-  const autoRecall = pluginConfig.autoRecall !== false; // default true
+  const configuredAgentId = pluginConfig.agentId; // fallback agent id from config
+  const autoIngest = pluginConfig.autoIngest !== false;
+  const autoRecall = pluginConfig.autoRecall !== false;
 
   api.logger?.info?.(
-    `[d33pmemory] Plugin loaded. autoIngest=${autoIngest}, autoRecall=${autoRecall}, agent=${agentId || "none"}`
+    `[d33pmemory] Plugin loaded. autoIngest=${autoIngest}, autoRecall=${autoRecall}, agentId=${configuredAgentId || "derived from session"}`
   );
 
-  // ── Hook: message:received — buffer inbound message ──
+  // ── Track sessionKey per turn ─────────────────────────
 
   if (autoIngest) {
-    api.registerHook(
-      "message:received",
-      async (event: any) => {
-        const content = event.context?.content;
-        const sessionKey = event.sessionKey;
-
-        if (!content || !sessionKey) return;
-
-        pendingInbound.set(sessionKey, {
-          content,
-          timestamp: Date.now(),
-        });
-
-        // Periodic cleanup
-        if (Math.random() < 0.1) cleanPending();
-      },
-      {
-        name: "d33pmemory.ingest-buffer",
-        description: "Buffers inbound messages for pairing with agent responses",
+    // Use before_agent_start to capture the sessionKey before the agent runs.
+    // This is more reliable than trying to extract it from event.context
+    // in agent_end (which may not always be populated).
+    api.on(
+      "before_agent_start",
+      (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+        if (ctx.sessionKey) {
+          // Store sessionKey at the turn level; agent_end will use it
+          (api as any).__d33pmemory_sessionKey = ctx.sessionKey as string;
+        }
       }
     );
 
-    // ── Hook: message:sent — auto-ingest conversation ──
+    // ── Hook: agent_end — auto-ingest conversation ──────
 
-    api.registerHook(
-      "message:sent",
-      async (event: any) => {
-        try {
-          const agentResponse = event.context?.content;
-          const sessionKey = event.sessionKey;
+    api.on("agent_end", async (event: Record<string, unknown>) => {
+      try {
+        // Grab the sessionKey we captured on before_agent_start
+        const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
 
-          if (!agentResponse || !sessionKey) return;
+        // Extract messages — look for the standard message array
+        const messages = event.messages as unknown[] | undefined;
+        if (!Array.isArray(messages) || messages.length === 0) return;
 
-          const pending = pendingInbound.get(sessionKey);
-          if (!pending) return; // No inbound message to pair with
+        // Get the last user turn and the last assistant turn
+        let lastUserContent = "";
+        let lastAssistantContent = "";
 
-          pendingInbound.delete(sessionKey);
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i] as Record<string, unknown>;
+          if (!msg || typeof msg !== "object") continue;
 
-          // Don't ingest very short or system messages
-          if (pending.content.length < 5) return;
-          if (pending.content.startsWith("/")) return; // skip slash commands
+          const role = msg.role as string;
+          let content = "";
 
-          const result = await client.ingest(
-            pending.content,
-            agentResponse,
-            agentId
-          );
-
-          if (result.memories_stored > 0) {
-            api.logger?.debug?.(
-              `[d33pmemory] Ingested ${result.memories_stored} memories from conversation`
-            );
+          if (typeof msg.content === "string") {
+            content = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            // Handle multimodal content blocks
+            for (const block of msg.content as Record<string, unknown>[]) {
+              if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
+                content += block.text + " ";
+              }
+            }
+            content = content.trim();
           }
-        } catch (err: any) {
-          api.logger?.warn?.(
-            `[d33pmemory] Ingest failed: ${err.message}`
+
+          if (!content) continue;
+
+          if (role === "user" && !lastUserContent) {
+            lastUserContent = content;
+          }
+          if (role === "assistant" && !lastAssistantContent) {
+            lastAssistantContent = content;
+            break; // found the paired assistant response
+          }
+
+          // If we've found both, stop
+          if (lastUserContent && lastAssistantContent) break;
+        }
+
+        // Skip system messages and very short messages
+        if (lastUserContent.length < 5) return;
+        if (lastUserContent.startsWith("/")) return;
+        if (lastAssistantContent.length < 2) return;
+
+        // Derive the agent identifier for this session
+        const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+        const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
+
+        const result = await client.ingest(
+          lastUserContent,
+          lastAssistantContent,
+          agentId,
+          undefined, // source — use config default
+          customId,
+          {
+            session_key: sessionKey || "unknown",
+            agent_id: agentId || "unknown",
+            ingested_via: "agent_end_hook",
+          }
+        );
+
+        if (result.memories_stored > 0) {
+          api.logger?.debug?.(
+            `[d33pmemory] Ingested ${result.memories_stored} memories (session=${sessionKey ?? "unknown"})`
           );
         }
-      },
-      {
-        name: "d33pmemory.auto-ingest",
-        description:
-          "Automatically ingests conversations into d33pmemory after agent responds",
+      } catch (err: any) {
+        api.logger?.warn?.(`[d33pmemory] Ingest failed: ${err.message}`);
       }
-    );
+    });
   }
 
   // ── Hook: agent:bootstrap — auto-recall memories ────
@@ -258,34 +317,42 @@ export default function register(api: any) {
   if (autoRecall) {
     api.registerHook(
       "agent:bootstrap",
-      async (event: any) => {
+      async (event: Record<string, unknown>) => {
         try {
-          // Build a recall query from the agent/session context
+          const sessionKey = event.sessionKey as string | undefined;
+          // Derive agentId for recall: prefer configured agentId, fall back to session-derived
+          const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+
           const query =
             pluginConfig.recallQuery ||
             "Important facts, preferences, and recent context about this user";
 
-          const result = await client.recall(query, agentId);
+          const result = await client.recall(
+            query,
+            agentId,
+            pluginConfig.recallMaxResults || 10,
+            pluginConfig.recallMinConfidence || 0.3
+          );
 
           if (result.memories.length === 0) return;
 
           const contextBlock = formatMemoriesForContext(result.memories);
 
-          // Inject as a bootstrap file
-          if (event.context?.bootstrapFiles && Array.isArray(event.context.bootstrapFiles)) {
-            event.context.bootstrapFiles.push({
+          if (
+            event.context?.bootstrapFiles &&
+            Array.isArray((event.context as any).bootstrapFiles)
+          ) {
+            (event.context as any).bootstrapFiles.push({
               path: "D33PMEMORY_CONTEXT.md",
               content: contextBlock,
             });
           }
 
           api.logger?.debug?.(
-            `[d33pmemory] Injected ${result.memories.length} memories into bootstrap context`
+            `[d33pmemory] Injected ${result.memories.length} memories into bootstrap context (agent=${agentId ?? "none"})`
           );
         } catch (err: any) {
-          api.logger?.warn?.(
-            `[d33pmemory] Auto-recall failed: ${err.message}`
-          );
+          api.logger?.warn?.(`[d33pmemory] Auto-recall failed: ${err.message}`);
         }
       },
       {
@@ -328,6 +395,10 @@ export default function register(api: any) {
       params: { query: string; max_results?: number; category?: string }
     ) {
       try {
+        // Derive agentId from current session if available
+        const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
+        const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+
         const result = await client.recall(
           params.query,
           agentId,
@@ -401,10 +472,21 @@ export default function register(api: any) {
         params: { user_message: string; agent_response?: string }
       ) {
         try {
+          const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
+          const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+          const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
+
           const result = await client.ingest(
             params.user_message,
             params.agent_response || "",
-            agentId
+            agentId,
+            undefined,
+            customId,
+            {
+              session_key: sessionKey || "manual",
+              agent_id: agentId || "manual",
+              ingested_via: "d33pmemory_ingest_tool",
+            }
           );
 
           return {
