@@ -1,33 +1,25 @@
 # d33pmemory OpenClaw Plugin
 
-Automatic memory for AI agents. No prompt engineering needed.
+> Automatic long-term memory for AI agents. No prompt engineering. No manual memory management.
 
-This plugin connects your OpenClaw agent to [d33pmemory](https://d33pmemory.com) — a hosted memory service that extracts structured knowledge from conversations and recalls it when relevant.
+This plugin connects [OpenClaw](https://openclaw.ai) agents to [d33pmemory](https://d33pmemory.com) — a hosted memory-as-a-service platform. Every conversation is automatically analyzed, facts are extracted, and relevant memories are injected into the agent's context before every response.
 
-## What it does
+## Quick Start
 
-| Feature | How it works |
-|---------|-------------|
-| **Auto-ingest** | Every conversation is automatically sent to d33pmemory after the agent responds. Memories are extracted and stored — facts, preferences, relationships, events, patterns. |
-| **Auto-recall** | When a session starts, relevant memories are automatically injected into the agent's context. The agent knows the user from the first message. |
-| **Manual tools** | `d33pmemory_recall` and `d33pmemory_ingest` tools are available for explicit memory operations. |
-
-**The agent never needs to "remember" to use memory. It just happens.**
-
-## Install
+### 1. Install
 
 ```bash
 openclaw plugins install @d33pmemory/openclaw-plugin
 ```
 
-Or clone and link for development:
+Or for development:
 
 ```bash
 git clone https://github.com/eduarddriessen1/d33pmemory-openclaw
 openclaw plugins install -l ./d33pmemory-openclaw
 ```
 
-## Configure
+### 2. Configure
 
 Add to your `openclaw.json`:
 
@@ -48,57 +40,182 @@ Add to your `openclaw.json`:
 }
 ```
 
-Then restart: `openclaw gateway restart`
+Restart the gateway:
 
-## Configuration options
+```bash
+openclaw gateway restart
+```
+
+That's it. The agent will now automatically remember everything about the user.
+
+## What Gets Remembered
+
+d33pmemory extracts structured memories from conversations:
+
+| Type | Examples |
+|------|----------|
+| **Facts** | Name, age, occupation, location |
+| **Preferences** | Likes, dislikes, communication style |
+| **Relationships** | Family, friends, colleagues |
+| **Events** | Things the user has done or plans to do |
+| **Patterns** | Behavioral habits, recurring themes |
+
+Memories are stored with confidence scores and source attribution (`stated` vs `inferred`).
+
+## Configuration Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `apiKey` | string | *required* | Your d33pmemory API key (`dm_xxx`) |
-| `apiUrl` | string | `https://api.d33pmemory.com` | API base URL |
-| `agentId` | string | derived from session | Agent name for scoped memory. **Leave empty** to auto-derive from workspace name (each OpenClaw workspace gets its own isolated memory namespace). **Set a value** to share one namespace across all workspaces. |
-| `autoIngest` | boolean | `true` | Auto-ingest every conversation turn |
-| `autoRecall` | boolean | `true` | Auto-recall memories on session bootstrap |
-| `recallQuery` | string | — | Custom recall query (defaults to general user context) |
-| `recallMaxResults` | number | `10` | Max memories to inject on auto-recall |
-| `recallMinConfidence` | number | `0.3` | Minimum confidence threshold for recall |
-| `source` | string | `"openclaw"` | Source label for ingested interactions |
+| `apiKey` | `string` | *required* | Your d33pmemory API key (`dm_xxx`) |
+| `apiUrl` | `string` | `https://api.d33pmemory.com` | API base URL |
+| `agentId` | `string` | derived from session | See [Multi-Agent Safety](#multi-agent-safety) |
+| `autoIngest` | `boolean` | `true` | Auto-ingest every conversation turn |
+| `autoRecall` | `boolean` | `true` | Auto-recall memories on session bootstrap |
+| `recallQuery` | `string` | general context query | Custom recall query for bootstrap |
+| `recallMaxResults` | `number` | `10` | Max memories injected on auto-recall |
+| `recallMinConfidence` | `number` | `0.3` | Minimum confidence threshold |
+| `source` | `string` | `"openclaw"` | Source label for ingested interactions |
 
-## Multi-agent & multi-workspace safety
+## Manual Tools
 
-**Session-level isolation**: Each OpenClaw session has a unique `sessionKey` (e.g. `agent:dm-agent:telegram:dm-agent-bot:direct:123456`). Memories from each session are stored with that session as a `custom_id`, so sessions never overwrite each other's memories.
+When the plugin is loaded, these tools are available to the agent automatically:
 
-**Workspace-level isolation**: OpenClaw workspaces have unique names (the part after `agent:` in the session key, e.g. `dm-agent`, `alice`, `dev-bot`). When `agentId` is **not set** in config:
+### `d33pmemory_recall`
 
-- `dm-agent` workspace → memories stored under `agent_id = "dm-agent"`
-- `alice` workspace → memories stored under `agent_id = "alice"`
-- Each workspace retrieves only its own memories on recall
+Search long-term memory for facts about the user.
 
-**Shared namespace**: If you set `agentId` in config (e.g. `"my-team"`), all workspaces using that API key share the same `agent_id` namespace. Memories from all workspaces mix — useful if you explicitly want shared memory across agents.
+```
+Search: "what are this user's dietary restrictions"
+Search: "what did the user mention about their weekend plans"
+Search: "user's work projects and tech stack"
+```
 
-## How it works
+### `d33pmemory_ingest`
+
+Manually store something important (beyond auto-ingest).
+
+```
+Store: "User prefers to be called Eduard, not Ed"
+Store: "User is building a SaaS called d33pmemory"
+```
+
+These tools are called automatically by the agent when it needs to recall or store something — no human trigger needed.
+
+## Multi-Agent Safety
+
+OpenClaw supports multiple agents and workspaces. The plugin isolates each agent's memories correctly.
+
+### How isolation works
+
+Every OpenClaw session has a **session key**:
+
+```
+agent:<workspace-name>:<channel>:<account>:<conversation>
+```
+
+Examples:
+- `agent:dm-agent:telegram:dm-agent-bot:direct:176654117`
+- `agent:alice:telegram:alice-bot:direct:123456`
+- `agent:dev-bot:slack:dev-bot:channel:C05ABC123`
+
+The plugin uses this to scope memory:
+
+| Config `agentId` | `agent_id` in API | Effect |
+|---|---|---|
+| `"my-team"` (set) | `"my-team"` | All workspaces share memories |
+| `""` or absent | Derived from session key | Each workspace is isolated |
+
+**Default behavior (no `agentId` set):**
+- `dm-agent` workspace → `agent_id = "dm-agent"`
+- `alice` workspace → `agent_id = "alice"`
+- Each workspace retrieves only its own memories
+
+**With shared `agentId`:**
+- Set `"agentId": "team-shared"` in config
+- All workspaces share the same memory namespace
+- Useful for team agents that should share context
+
+### Session-level deduplication
+
+Each ingest also sends a `custom_id` derived from the full session key. This prevents one session's memories from overwriting another's, even within the same `agent_id` namespace.
+
+## How It Works
+
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full technical explanation.
 
 ### Auto-ingest flow
+
 ```
-User message → Agent responds → api.on("agent_end") fires →
-Plugin extracts user+assistant turns →
-POST /v1/ingest (with session custom_id + workspace agent_id) →
-d33pmemory extracts structured memories → Stored
+User message
+    → Agent responds
+        → "agent_end" lifecycle hook fires
+            → Plugin extracts user turn + agent turn
+            → resolveAgentId() → agent_id
+            → POST /v1/ingest
+                → d33pmemory extracts structured memories
+                → Stored with session-scoped custom_id
 ```
 
 ### Auto-recall flow
+
 ```
-New session starts → api.registerHook("agent:bootstrap") fires →
-Plugin calls POST /v1/recall (scoped to workspace agent_id) →
-Relevant memories returned → Injected as D33PMEMORY_CONTEXT.md →
-Agent sees memories in its bootstrap context
+Session starts (/new)
+    → "agent:bootstrap" hook fires
+        → POST /v1/recall (scoped to workspace agent_id)
+            → Relevant memories returned
+            → Injected as D33PMEMORY_CONTEXT.md
+    → Agent bootstrap context includes memories
+        → Agent sees user context before first response
+```
+
+## Repository Structure
+
+```
+d33pmemory-openclaw/
+├── index.ts              # Plugin entry — hooks, tools, client
+├── openclaw.plugin.json  # Plugin manifest + config schema
+├── package.json
+├── README.md             # This file
+└── docs/
+    └── ARCHITECTURE.md   # Technical deep-dive
 ```
 
 ## Prerequisites
 
-1. A d33pmemory account ([sign up](https://d33pmemory-nextjs.vercel.app/signup))
-2. An active plan
-3. An API key (create in dashboard)
+1. **OpenClaw** — [Install guide](https://docs.openclaw.ai)
+2. **d33pmemory account** — [Sign up](https://d33pmemory-nextjs.vercel.app/signup)
+3. **d33pmemory API key** — Create in your dashboard
+
+## Troubleshooting
+
+### Plugin not loading
+
+```bash
+openclaw plugins list
+# Should show: d33pmemory ✓
+```
+
+Check the gateway log:
+
+```bash
+tail -f ~/.openclaw/gateway.log | grep d33pmemory
+```
+
+### Hooks not firing
+
+1. Make sure `autoIngest` / `autoRecall` are not explicitly set to `false` in config
+2. Restart the gateway after config changes: `openclaw gateway restart`
+3. Check `openclaw status` for plugin load confirmation
+
+### Memories not being recalled
+
+1. Verify the `apiKey` is correct
+2. Check that the agent has an entry in your d33pmemory dashboard
+3. Try the `d33pmemory_recall` tool manually with a query like `"user preferences and facts"`
+
+### Wrong agent namespace
+
+If memories are mixing between workspaces, check that `agentId` is **not** set in config if you want per-workspace isolation.
 
 ## License
 
