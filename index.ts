@@ -124,19 +124,37 @@ function createClient(config: PluginConfig) {
 // ── Session Key Derivation ─────────────────────────────
 
 /**
- * Derives a safe, unique agent name from a session key.
- * sessionKey format: agent:<workspace-name>:<channel>:<account>:<conversation>
+ * Session key format: agent:<workspace-name>:<channel>:<account>:<conversation>
  * Example: agent:dm-agent:telegram:dm-agent-bot:direct:176654117
- * → workspace: dm-agent
- * → agent: dm-agent
+ * Example: agent:alice:telegram:alice-bot:direct:123456
  *
- * This lets each agent/workspace namespace its memories even if they
- * share the same d33pmemory API key.
+ * The workspace name (parts[1]) is the unique identifier for each agent/workspace.
+ * This is the key isolation mechanism for multi-agent setups.
  */
-function deriveAgentFromSessionKey(sessionKey: string): string {
+function deriveWorkspaceName(sessionKey: string): string {
   const parts = sessionKey.split(":");
-  // parts[0] = "agent", parts[1] = workspace/agent name
   return parts[1] || "unknown";
+}
+
+/**
+ * Resolves the agent_id for API calls.
+ *
+ * Logic:
+ *   - If config.agentId is explicitly set → use it (user wants shared namespace)
+ *   - If config.agentId is empty/undefined → derive from session key workspace name
+ *     (each workspace/agent gets its own memory namespace)
+ *
+ * This means:
+ *   - dm-agent workspace → memories stored under agent_id="dm-agent"
+ *   - alice workspace    → memories stored under agent_id="alice"
+ *
+ * Even with the same API key, memories stay isolated per workspace.
+ */
+function resolveAgentId(configuredAgentId: string | undefined, sessionKey: string): string {
+  if (configuredAgentId && configuredAgentId.trim() !== "") {
+    return configuredAgentId.trim();
+  }
+  return deriveWorkspaceName(sessionKey);
 }
 
 function buildMemoryCustomId(sessionKey: string): string {
@@ -284,8 +302,12 @@ export default function register(api: any) {
         if (lastUserContent.startsWith("/")) return;
         if (lastAssistantContent.length < 2) return;
 
-        // Derive the agent identifier for this session
-        const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+        // Resolve agent_id:
+        // - If config.agentId is set → use it (shared namespace across workspaces)
+        // - Otherwise → derive from session key workspace name (each workspace isolated)
+        const agentId = sessionKey
+          ? resolveAgentId(configuredAgentId, sessionKey)
+          : configuredAgentId;
         const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
 
         const result = await client.ingest(
@@ -296,14 +318,15 @@ export default function register(api: any) {
           customId,
           {
             session_key: sessionKey || "unknown",
-            agent_id: agentId || "unknown",
+            agent_id: agentId,
+            workspace: sessionKey ? deriveWorkspaceName(sessionKey) : "unknown",
             ingested_via: "agent_end_hook",
           }
         );
 
         if (result.memories_stored > 0) {
           api.logger?.debug?.(
-            `[d33pmemory] Ingested ${result.memories_stored} memories (session=${sessionKey ?? "unknown"})`
+            `[d33pmemory] Ingested ${result.memories_stored} memories workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"} agent=${agentId}`
           );
         }
       } catch (err: any) {
@@ -320,8 +343,9 @@ export default function register(api: any) {
       async (event: Record<string, unknown>) => {
         try {
           const sessionKey = event.sessionKey as string | undefined;
-          // Derive agentId for recall: prefer configured agentId, fall back to session-derived
-          const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+          const agentId = sessionKey
+            ? resolveAgentId(configuredAgentId, sessionKey)
+            : configuredAgentId;
 
           const query =
             pluginConfig.recallQuery ||
@@ -349,7 +373,7 @@ export default function register(api: any) {
           }
 
           api.logger?.debug?.(
-            `[d33pmemory] Injected ${result.memories.length} memories into bootstrap context (agent=${agentId ?? "none"})`
+            `[d33pmemory] Injected ${result.memories.length} memories into bootstrap context (workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"})`
           );
         } catch (err: any) {
           api.logger?.warn?.(`[d33pmemory] Auto-recall failed: ${err.message}`);
@@ -395,9 +419,10 @@ export default function register(api: any) {
       params: { query: string; max_results?: number; category?: string }
     ) {
       try {
-        // Derive agentId from current session if available
         const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
-        const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+        const agentId = sessionKey
+          ? resolveAgentId(configuredAgentId, sessionKey)
+          : configuredAgentId;
 
         const result = await client.recall(
           params.query,
@@ -473,7 +498,9 @@ export default function register(api: any) {
       ) {
         try {
           const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
-          const agentId = configuredAgentId || (sessionKey ? deriveAgentFromSessionKey(sessionKey) : undefined);
+          const agentId = sessionKey
+            ? resolveAgentId(configuredAgentId, sessionKey)
+            : configuredAgentId;
           const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
 
           const result = await client.ingest(
@@ -484,7 +511,8 @@ export default function register(api: any) {
             customId,
             {
               session_key: sessionKey || "manual",
-              agent_id: agentId || "manual",
+              agent_id: agentId,
+              workspace: sessionKey ? deriveWorkspaceName(sessionKey) : "manual",
               ingested_via: "d33pmemory_ingest_tool",
             }
           );

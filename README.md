@@ -39,7 +39,6 @@ Add to your `openclaw.json`:
         "enabled": true,
         "config": {
           "apiKey": "dm_your_api_key_here",
-          "agentId": "my-agent",
           "autoIngest": true,
           "autoRecall": true
         }
@@ -57,7 +56,7 @@ Then restart: `openclaw gateway restart`
 |--------|------|---------|-------------|
 | `apiKey` | string | *required* | Your d33pmemory API key (`dm_xxx`) |
 | `apiUrl` | string | `https://api.d33pmemory.com` | API base URL |
-| `agentId` | string | — | Agent name for scoped memory (must be registered in d33pmemory) |
+| `agentId` | string | derived from session | Agent name for scoped memory. **Leave empty** to auto-derive from workspace name (each OpenClaw workspace gets its own isolated memory namespace). **Set a value** to share one namespace across all workspaces. |
 | `autoIngest` | boolean | `true` | Auto-ingest every conversation turn |
 | `autoRecall` | boolean | `true` | Auto-recall memories on session bootstrap |
 | `recallQuery` | string | — | Custom recall query (defaults to general user context) |
@@ -65,35 +64,41 @@ Then restart: `openclaw gateway restart`
 | `recallMinConfidence` | number | `0.3` | Minimum confidence threshold for recall |
 | `source` | string | `"openclaw"` | Source label for ingested interactions |
 
+## Multi-agent & multi-workspace safety
+
+**Session-level isolation**: Each OpenClaw session has a unique `sessionKey` (e.g. `agent:dm-agent:telegram:dm-agent-bot:direct:123456`). Memories from each session are stored with that session as a `custom_id`, so sessions never overwrite each other's memories.
+
+**Workspace-level isolation**: OpenClaw workspaces have unique names (the part after `agent:` in the session key, e.g. `dm-agent`, `alice`, `dev-bot`). When `agentId` is **not set** in config:
+
+- `dm-agent` workspace → memories stored under `agent_id = "dm-agent"`
+- `alice` workspace → memories stored under `agent_id = "alice"`
+- Each workspace retrieves only its own memories on recall
+
+**Shared namespace**: If you set `agentId` in config (e.g. `"my-team"`), all workspaces using that API key share the same `agent_id` namespace. Memories from all workspaces mix — useful if you explicitly want shared memory across agents.
+
 ## How it works
 
 ### Auto-ingest flow
 ```
-User sends message → Agent processes and responds →
-Plugin captures both → POST /v1/ingest →
-d33pmemory extracts structured memories → Stored with embeddings
+User message → Agent responds → api.on("agent_end") fires →
+Plugin extracts user+assistant turns →
+POST /v1/ingest (with session custom_id + workspace agent_id) →
+d33pmemory extracts structured memories → Stored
 ```
 
 ### Auto-recall flow
 ```
-New session starts → Plugin calls POST /v1/recall →
+New session starts → api.registerHook("agent:bootstrap") fires →
+Plugin calls POST /v1/recall (scoped to workspace agent_id) →
 Relevant memories returned → Injected as D33PMEMORY_CONTEXT.md →
 Agent sees memories in its bootstrap context
 ```
-
-### Memory scoping (teams)
-
-If you use d33pmemory teams:
-- Memories are automatically scoped as `private` (agent-specific) or `shared` (team-wide)
-- The LLM decides scope during extraction
-- Your agent only sees its own private memories + team shared memories
 
 ## Prerequisites
 
 1. A d33pmemory account ([sign up](https://d33pmemory-nextjs.vercel.app/signup))
 2. An active plan
 3. An API key (create in dashboard)
-4. A registered agent (create in dashboard or via API)
 
 ## License
 
