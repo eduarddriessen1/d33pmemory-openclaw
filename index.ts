@@ -253,6 +253,9 @@ export default function register(api: any) {
 
     api.on("agent_end", async (event: Record<string, unknown>) => {
       try {
+        // Guard: only capture on successful agent turns
+        if (!event.success) return;
+
         // Grab the sessionKey we captured on before_agent_start
         const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
 
