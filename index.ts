@@ -55,6 +55,8 @@ function createClient(config: PluginConfig) {
     path: string,
     body: Record<string, unknown>
   ): Promise<T> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const res = await fetch(`${baseUrl}${path}`, {
       method: "POST",
       headers: {
@@ -62,7 +64,9 @@ function createClient(config: PluginConfig) {
         Authorization: `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify(body),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
 
     if (!res.ok) {
       const text = await res.text();
@@ -251,8 +255,9 @@ export default function register(api: any) {
 
     // ── Hook: agent_end — auto-ingest conversation ──────
 
-    api.on("agent_end", async (event: Record<string, unknown>) => {
-      try {
+    api.on("agent_end", (event: Record<string, unknown>) => {
+      // Fire-and-forget: don't await so we never block the gateway
+      (async () => { try {
         // Guard: only capture on successful agent turns
         if (!event.success) return;
 
@@ -288,15 +293,13 @@ export default function register(api: any) {
 
           if (!content) continue;
 
+          if (role === "assistant" && !lastAssistantContent) {
+            lastAssistantContent = content;
+          }
           if (role === "user" && !lastUserContent) {
             lastUserContent = content;
           }
-          if (role === "assistant" && !lastAssistantContent) {
-            lastAssistantContent = content;
-            break; // found the paired assistant response
-          }
 
-          // If we've found both, stop
           if (lastUserContent && lastAssistantContent) break;
         }
 
@@ -335,6 +338,7 @@ export default function register(api: any) {
       } catch (err: any) {
         api.logger?.warn?.(`[d33pmemory] Ingest failed: ${err.message}`);
       }
+      })();
     });
   }
 
