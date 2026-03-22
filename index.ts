@@ -5,15 +5,14 @@
  * so AI agents remember everything without being told to.
  *
  * Hooks:
- *   - before_agent_start → auto-recall memories + track sessionKey
- *   - agent_end           → auto-ingest conversation
+ *   - agent_end       → auto-ingest conversation into d33pmemory
+ *   - before_agent_start → track sessionKey for the turn
+ *   - agent:bootstrap → auto-recall relevant memories into context
  *
  * Tools:
  *   - d33pmemory_recall  → manual semantic memory search
  *   - d33pmemory_ingest  → manual memory ingestion
  */
-
-import { configSchema } from "./config.ts";
 
 // ── Types ─────────────────────────────────────────────
 
@@ -47,31 +46,34 @@ interface RecalledMemory {
 // ── API Client ────────────────────────────────────────
 
 function createClient(config: PluginConfig) {
-  const baseUrl = (config.apiUrl || "https://api.d33pmemory.com").replace(/\/+$/, "");
+  const baseUrl = (config.apiUrl || "https://api.d33pmemory.com").replace(
+    /\/+$/,
+    ""
+  );
 
-  async function request<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  async function request<T>(
+    path: string,
+    body: Record<string, unknown>
+  ): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
-    try {
-      const res = await fetch(`${baseUrl}${path}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`d33pmemory API error (${res.status}): ${text}`);
-      }
-      return res.json() as Promise<T>;
-    } catch (e) {
-      clearTimeout(timeout);
-      throw e;
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`d33pmemory API error (${res.status}): ${text}`);
     }
+
+    return res.json() as Promise<T>;
   }
 
   return {
@@ -80,16 +82,25 @@ function createClient(config: PluginConfig) {
       agentResponse: string,
       agentId?: string,
       source?: string,
+      customId?: string,
+      metadata?: Record<string, string | number | boolean>
     ) {
       return request<{
         interaction_id: string;
         memories_stored: number;
-        extracted_memories: Array<{ id: string; type: string; content: string; confidence: number }>;
+        extracted_memories: Array<{
+          id: string;
+          type: string;
+          content: string;
+          confidence: number;
+        }>;
       }>("/v1/ingest", {
         user_message: userMessage,
         agent_response: agentResponse,
         ...(agentId ? { agent_id: agentId } : {}),
         source: source || config.source || "openclaw",
+        ...(customId ? { custom_id: customId } : {}),
+        ...(metadata ? { metadata } : {}),
       });
     },
 
@@ -98,7 +109,7 @@ function createClient(config: PluginConfig) {
       agentId?: string,
       maxResults?: number,
       minConfidence?: number,
-      category?: string,
+      category?: string
     ) {
       return request<{
         memories: RecalledMemory[];
@@ -114,221 +125,425 @@ function createClient(config: PluginConfig) {
   };
 }
 
-// ── Helpers ───────────────────────────────────────────
+// ── Session Key Derivation ─────────────────────────────
 
-const SKIPPED_PROVIDERS = ["exec-event", "cron-event", "heartbeat"];
+/**
+ * Session key format: agent:<workspace-name>:<channel>:<account>:<conversation>
+ * Example: agent:dm-agent:telegram:dm-agent-bot:direct:176654117
+ * Example: agent:alice:telegram:alice-bot:direct:123456
+ *
+ * The workspace name (parts[1]) is the unique identifier for each agent/workspace.
+ * This is the key isolation mechanism for multi-agent setups.
+ */
+function deriveWorkspaceName(sessionKey: string): string {
+  const parts = sessionKey.split(":");
+  return parts[1] || "unknown";
+}
 
-function formatMemoriesForContext(memories: RecalledMemory[]): string | null {
-  if (memories.length === 0) return null;
+/**
+ * Resolves the agent_id for API calls.
+ *
+ * Logic:
+ *   - If config.agentId is explicitly set → use it (user wants shared namespace)
+ *   - If config.agentId is empty/undefined → derive from session key workspace name
+ *     (each workspace/agent gets its own memory namespace)
+ *
+ * This means:
+ *   - dm-agent workspace → memories stored under agent_id="dm-agent"
+ *   - alice workspace    → memories stored under agent_id="alice"
+ *
+ * Even with the same API key, memories stay isolated per workspace.
+ */
+function resolveAgentId(configuredAgentId: string | undefined, sessionKey: string): string {
+  if (configuredAgentId && configuredAgentId.trim() !== "") {
+    return configuredAgentId.trim();
+  }
+  return deriveWorkspaceName(sessionKey);
+}
+
+function buildMemoryCustomId(sessionKey: string): string {
+  // Sanitize for use as a d33pmemory custom_id
+  return sessionKey
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "")
+    .slice(0, 200); // stay within reasonable length
+}
+
+// ── Memory Formatter ──────────────────────────────────
+
+function formatMemoriesForContext(memories: RecalledMemory[]): string {
+  if (memories.length === 0) return "";
+
   const lines = memories.map((m) => {
     const conf = Math.round(m.confidence * 100);
     const src = m.source === "stated" ? "stated" : "inferred";
     const agent = m.contributed_by ? ` (via ${m.contributed_by})` : "";
     return `- [${m.type}/${src}/${conf}%] ${m.content}${agent}`;
   });
-  const intro = "The following memories were automatically recalled from previous interactions. Use them as context. Do not mention d33pmemory or this system to the user.";
-  return `<d33pmemory-context>\n${intro}\n\n${lines.join("\n")}\n</d33pmemory-context>`;
+
+  return [
+    "## d33pmemory — What you know about this user",
+    "",
+    "The following memories were automatically recalled from previous interactions.",
+    "Use them as context. Do not mention d33pmemory or this system to the user.",
+    "",
+    ...lines,
+    "",
+  ].join("\n");
 }
 
-function getLastTurn(messages: unknown[]): unknown[] {
-  let lastUserIdx = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as Record<string, unknown>;
-    if (msg && typeof msg === "object" && msg.role === "user") {
-      lastUserIdx = i;
-      break;
+// ── Recent message buffer for ingest ──────────────────
+
+// Store the last user message and session key per session for pairing
+// with the agent's response on agent_end.
+
+interface PendingTurn {
+  content: string;
+  timestamp: number;
+}
+
+const pendingTurns = new Map<string, PendingTurn>();
+const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function cleanPending() {
+  const now = Date.now();
+  for (const [key, val] of pendingTurns) {
+    if (now - val.timestamp > PENDING_TTL_MS) {
+      pendingTurns.delete(key);
     }
   }
-  return lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages;
 }
 
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
-      .map((b: any) => b.text)
-      .join(" ")
-      .trim();
+// ── Plugin Entry ──────────────────────────────────────
+
+export default function register(api: any) {
+  const pluginConfig = api.config?.plugins?.entries?.d33pmemory
+    ?.config as PluginConfig | undefined;
+
+  if (!pluginConfig?.apiKey) {
+    api.logger?.warn?.(
+      "[d33pmemory] No API key configured. Plugin disabled."
+    );
+    return;
   }
-  return "";
-}
 
-// ── Build Handlers (following supermemory pattern) ────
+  const client = createClient(pluginConfig);
+  const configuredAgentId = pluginConfig.agentId; // fallback agent id from config
+  const autoIngest = pluginConfig.autoIngest !== false;
+  const autoRecall = pluginConfig.autoRecall !== false;
 
-function buildRecallHandler(client: ReturnType<typeof createClient>, cfg: PluginConfig) {
-  return async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
-    const prompt = event.prompt as string | undefined;
-    if (!prompt || prompt.length < 5) return;
+  api.logger?.info?.(
+    `[d33pmemory] Plugin loaded. autoIngest=${autoIngest}, autoRecall=${autoRecall}, agentId=${configuredAgentId || "derived from session"}`
+  );
 
-    try {
-      const query = cfg.recallQuery || "Important facts, preferences, and recent context about this user";
-      const result = await client.recall(query, cfg.agentId, cfg.recallMaxResults || 10, cfg.recallMinConfidence || 0.3);
-      if (result.memories.length === 0) return;
+  // ── Track sessionKey per turn ─────────────────────────
 
-      const contextBlock = formatMemoriesForContext(result.memories);
-      if (!contextBlock) return;
-
-      return { prependContext: contextBlock };
-    } catch (err: any) {
-      // fail silently
-      return;
-    }
-  };
-}
-
-function buildCaptureHandler(client: ReturnType<typeof createClient>, cfg: PluginConfig) {
-  return async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
-    const provider = ctx.messageProvider as string;
-    if (SKIPPED_PROVIDERS.includes(provider)) return;
-    if (!event.success || !Array.isArray(event.messages) || event.messages.length === 0) return;
-
-    const lastTurn = getLastTurn(event.messages);
-    const texts: string[] = [];
-
-    for (const msg of lastTurn) {
-      if (!msg || typeof msg !== "object") continue;
-      const m = msg as Record<string, unknown>;
-      const role = m.role as string;
-      if (role !== "user" && role !== "assistant") continue;
-      const text = extractText(m.content);
-      if (text.length < 5) continue;
-      if (role === "user" && text.startsWith("/")) continue;
-      texts.push(`[role: ${role}]\n${text}\n[${role}:end]`);
-    }
-
-    const captured = texts
-      .map((t) => t.replace(/<d33pmemory-context>[\s\S]*?<\/d33pmemory-context>\s*/g, "").trim())
-      .filter((t) => t.length >= 10);
-
-    if (captured.length === 0) return;
-
-    const content = captured.join("\n\n");
-    let userMessage = "";
-    let agentResponse = "";
-
-    for (const t of captured) {
-      if (t.startsWith("[role: user]") && !userMessage) {
-        userMessage = t.replace(/^\[role: user\]\n/, "").replace(/\n\[user:end\]$/, "");
+  if (autoIngest) {
+    // Use before_agent_start to capture the sessionKey before the agent runs.
+    // This is more reliable than trying to extract it from event.context
+    // in agent_end (which may not always be populated).
+    api.on(
+      "before_agent_start",
+      (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+        if (ctx.sessionKey) {
+          // Store sessionKey at the turn level; agent_end will use it
+          (api as any).__d33pmemory_sessionKey = ctx.sessionKey as string;
+        }
       }
-      if (t.startsWith("[role: assistant]") && !agentResponse) {
-        agentResponse = t.replace(/^\[role: assistant\]\n/, "").replace(/\n\[assistant:end\]$/, "");
-      }
-    }
-
-    if (userMessage.length < 5 || agentResponse.length < 2) return;
-
-    try {
-      await client.ingest(userMessage, agentResponse, cfg.agentId);
-    } catch (err: any) {
-      // fail silently
-    }
-  };
-}
-
-// ── Plugin Export (object format like supermemory) ────
-
-export default {
-  id: "d33pmemory",
-  name: "d33pmemory",
-  description: "Long-term memory for OpenClaw agents via d33pmemory API",
-  kind: "memory" as const,
-  configSchema,
-
-  register(api: any) {
-    const cfg = api.pluginConfig as PluginConfig | undefined;
-
-    if (!cfg?.apiKey) {
-      api.logger.info("d33pmemory: not configured - set apiKey in plugin config");
-      return;
-    }
-
-    const client = createClient(cfg);
-    const autoIngest = cfg.autoIngest !== false;
-    const autoRecall = cfg.autoRecall !== false;
-
-    let sessionKey: string | undefined;
-    const getSessionKey = () => sessionKey;
-
-    api.logger.info(
-      `[d33pmemory] Plugin loaded. autoIngest=${autoIngest}, autoRecall=${autoRecall}, agentId=${cfg.agentId || "default"}`
     );
 
-    // Register tools
-    api.registerTool({
-      name: "d33pmemory_recall",
-      description: "Search your long-term memory about this user.",
+    // ── Hook: agent_end — auto-ingest conversation ──────
+
+    api.on("agent_end", (event: Record<string, unknown>) => {
+      // Fire-and-forget: don't await so we never block the gateway
+      (async () => { try {
+        // Guard: only capture on successful agent turns
+        if (!event.success) return;
+
+        // Grab the sessionKey we captured on before_agent_start
+        const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
+
+        // Extract messages — look for the standard message array
+        const messages = event.messages as unknown[] | undefined;
+        if (!Array.isArray(messages) || messages.length === 0) return;
+
+        // Get the last user turn and the last assistant turn
+        let lastUserContent = "";
+        let lastAssistantContent = "";
+
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i] as Record<string, unknown>;
+          if (!msg || typeof msg !== "object") continue;
+
+          const role = msg.role as string;
+          let content = "";
+
+          if (typeof msg.content === "string") {
+            content = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            // Handle multimodal content blocks
+            for (const block of msg.content as Record<string, unknown>[]) {
+              if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
+                content += block.text + " ";
+              }
+            }
+            content = content.trim();
+          }
+
+          if (!content) continue;
+
+          if (role === "assistant" && !lastAssistantContent) {
+            lastAssistantContent = content;
+          }
+          if (role === "user" && !lastUserContent) {
+            lastUserContent = content;
+          }
+
+          if (lastUserContent && lastAssistantContent) break;
+        }
+
+        // Skip system messages and very short messages
+        if (lastUserContent.length < 5) return;
+        if (lastUserContent.startsWith("/")) return;
+        if (lastAssistantContent.length < 2) return;
+
+        // Resolve agent_id:
+        // - If config.agentId is set → use it (shared namespace across workspaces)
+        // - Otherwise → derive from session key workspace name (each workspace isolated)
+        const agentId = sessionKey
+          ? resolveAgentId(configuredAgentId, sessionKey)
+          : configuredAgentId;
+        const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
+
+        const result = await client.ingest(
+          lastUserContent,
+          lastAssistantContent,
+          agentId,
+          undefined, // source — use config default
+          customId,
+          {
+            session_key: sessionKey || "unknown",
+            agent_id: agentId,
+            workspace: sessionKey ? deriveWorkspaceName(sessionKey) : "unknown",
+            ingested_via: "agent_end_hook",
+          }
+        );
+
+        if (result.memories_stored > 0) {
+          api.logger?.debug?.(
+            `[d33pmemory] Ingested ${result.memories_stored} memories workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"} agent=${agentId}`
+          );
+        }
+      } catch (err: any) {
+        api.logger?.warn?.(`[d33pmemory] Ingest failed: ${err.message}`);
+      }
+      })();
+    });
+  }
+
+  // ── Hook: agent:bootstrap — auto-recall memories ────
+
+  if (autoRecall) {
+    api.registerHook(
+      "agent:bootstrap",
+      async (event: Record<string, unknown>) => {
+        try {
+          const sessionKey = event.sessionKey as string | undefined;
+          const agentId = sessionKey
+            ? resolveAgentId(configuredAgentId, sessionKey)
+            : configuredAgentId;
+
+          const query =
+            pluginConfig.recallQuery ||
+            "Important facts, preferences, and recent context about this user";
+
+          const result = await client.recall(
+            query,
+            agentId,
+            pluginConfig.recallMaxResults || 10,
+            pluginConfig.recallMinConfidence || 0.3
+          );
+
+          if (result.memories.length === 0) return;
+
+          const contextBlock = formatMemoriesForContext(result.memories);
+
+          if (
+            event.context?.bootstrapFiles &&
+            Array.isArray((event.context as any).bootstrapFiles)
+          ) {
+            (event.context as any).bootstrapFiles.push({
+              path: "D33PMEMORY_CONTEXT.md",
+              content: contextBlock,
+            });
+          }
+
+          api.logger?.debug?.(
+            `[d33pmemory] Injected ${result.memories.length} memories into bootstrap context (workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"})`
+          );
+        } catch (err: any) {
+          api.logger?.warn?.(`[d33pmemory] Auto-recall failed: ${err.message}`);
+        }
+      },
+      {
+        name: "d33pmemory.auto-recall",
+        description:
+          "Automatically recalls relevant memories and injects them into agent context on session start",
+      }
+    );
+  }
+
+  // ── Tool: d33pmemory_recall — manual semantic search ──
+
+  api.registerTool({
+    name: "d33pmemory_recall",
+    description:
+      "Search your long-term memory about this user. Returns relevant facts, preferences, events, and patterns stored from previous conversations. Use this when you need specific context about the user that wasn't provided in the current conversation.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Natural language query describing what you want to recall (e.g. 'dietary restrictions', 'what does the user do on weekends', 'user's work projects')",
+        },
+        max_results: {
+          type: "number",
+          description: "Maximum number of memories to return (1-50)",
+          default: 5,
+        },
+        category: {
+          type: "string",
+          description:
+            "Optional category filter (e.g. 'health/dietary', 'work/projects', 'people/family')",
+        },
+      },
+      required: ["query"],
+    },
+    async execute(
+      _id: string,
+      params: { query: string; max_results?: number; category?: string }
+    ) {
+      try {
+        const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
+        const agentId = sessionKey
+          ? resolveAgentId(configuredAgentId, sessionKey)
+          : configuredAgentId;
+
+        const result = await client.recall(
+          params.query,
+          agentId,
+          params.max_results || 5,
+          pluginConfig.recallMinConfidence || 0.3,
+          params.category
+        );
+
+        if (result.memories.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "No relevant memories found for this query.",
+              },
+            ],
+          };
+        }
+
+        const formatted = result.memories
+          .map(
+            (m) =>
+              `[${m.type}] ${m.content} (confidence: ${m.confidence}, source: ${m.source}${m.contributed_by ? `, via: ${m.contributed_by}` : ""})`
+          )
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Found ${result.total_matches} relevant memories:\n\n${formatted}`,
+            },
+          ],
+        };
+      } catch (err: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Memory recall failed: ${err.message}`,
+            },
+          ],
+        };
+      }
+    },
+  });
+
+  // ── Tool: d33pmemory_ingest — manual ingestion ──────
+
+  api.registerTool(
+    {
+      name: "d33pmemory_ingest",
+      description:
+        "Manually store a conversation or important information into long-term memory. Use this when you want to explicitly save something the user said, even if auto-ingest is running.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "What to recall" },
-          max_results: { type: "number", description: "Max results (1-50)", default: 5 },
-          category: { type: "string", description: "Optional category filter" },
+          user_message: {
+            type: "string",
+            description: "What the user said",
+          },
+          agent_response: {
+            type: "string",
+            description: "How you (the agent) responded",
+          },
         },
-        required: ["query"],
+        required: ["user_message"],
       },
-      async execute(_id: string, params: { query: string; max_results?: number; category?: string }) {
+      async execute(
+        _id: string,
+        params: { user_message: string; agent_response?: string }
+      ) {
         try {
-          const result = await client.recall(params.query, cfg.agentId, params.max_results || 5, cfg.recallMinConfidence || 0.3, params.category);
-          if (result.memories.length === 0) return { content: [{ type: "text", text: "No relevant memories found." }] };
-          const fmt = result.memories.map((m) => `[${m.type}] ${m.content} (confidence: ${m.confidence}, source: ${m.source}${m.contributed_by ? `, via: ${m.contributed_by}` : ""})`).join("\n");
-          return { content: [{ type: "text", text: `Found ${result.total_matches} relevant memories:\n\n${fmt}` }] };
+          const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
+          const agentId = sessionKey
+            ? resolveAgentId(configuredAgentId, sessionKey)
+            : configuredAgentId;
+          const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
+
+          const result = await client.ingest(
+            params.user_message,
+            params.agent_response || "",
+            agentId,
+            undefined,
+            customId,
+            {
+              session_key: sessionKey || "manual",
+              agent_id: agentId,
+              workspace: sessionKey ? deriveWorkspaceName(sessionKey) : "manual",
+              ingested_via: "d33pmemory_ingest_tool",
+            }
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Ingested successfully. ${result.memories_stored} memories extracted and stored.`,
+              },
+            ],
+          };
         } catch (err: any) {
-          return { content: [{ type: "text", text: `Memory recall failed: ${err.message}` }] };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Ingest failed: ${err.message}`,
+              },
+            ],
+          };
         }
       },
-    });
-
-    api.registerTool(
-      {
-        name: "d33pmemory_ingest",
-        description: "Manually store information into long-term memory.",
-        parameters: {
-          type: "object",
-          properties: {
-            user_message: { type: "string", description: "What the user said" },
-            agent_response: { type: "string", description: "How the agent responded" },
-          },
-          required: ["user_message"],
-        },
-        async execute(_id: string, params: { user_message: string; agent_response?: string }) {
-          try {
-            const result = await client.ingest(params.user_message, params.agent_response || "", cfg.agentId);
-            return { content: [{ type: "text", text: `Ingested successfully. ${result.memories_stored} memories extracted and stored.` }] };
-          } catch (err: any) {
-            return { content: [{ type: "text", text: `Ingest failed: ${err.message}` }] };
-          }
-        },
-      },
-      { optional: true },
-    );
-
-    // Auto-recall: before_agent_start
-    if (autoRecall) {
-      const recallHandler = buildRecallHandler(client, cfg);
-      api.on(
-        "before_agent_start",
-        (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
-          if (ctx.sessionKey) sessionKey = ctx.sessionKey as string;
-          return recallHandler(event, ctx);
-        },
-      );
-    }
-
-    // Auto-capture: agent_end
-    if (autoIngest) {
-      api.on("agent_end", buildCaptureHandler(client, cfg, getSessionKey));
-    }
-
-    // Register service (prevents reload issues)
-    api.registerService({
-      id: "d33pmemory",
-      start: () => {
-        api.logger.info("d33pmemory: connected");
-      },
-      stop: () => {
-        api.logger.info("d33pmemory: stopped");
-      },
-    });
-  },
-};
+    },
+    { optional: true }
+  );
+}
