@@ -26,6 +26,8 @@ interface PluginConfig {
   recallMaxResults?: number;
   recallMinConfidence?: number;
   source?: string;
+  midTurnRecall?: boolean;
+  midTurnRecallMaxResults?: number;
 }
 
 interface RecalledMemory {
@@ -193,6 +195,50 @@ function formatMemoriesForContext(memories: RecalledMemory[]): string {
   ].join("\n");
 }
 
+// ── Personal Context Signal Detection ────────────────
+//
+// Detects whether an incoming message likely needs personal context
+// to answer well. Used to decide whether to fire a mid-turn recall.
+//
+// We keep this intentionally broad — false positives are cheap
+// (an extra API call), false negatives are expensive (wrong answer).
+
+const PERSONAL_CONTEXT_PATTERNS = [
+  // Direct questions about the user's own info
+  /\bmy\b.{0,40}\b(name|dog|cat|pet|partner|wife|husband|girlfriend|boyfriend|kid|child|children|son|daughter|parent|mom|dad|brother|sister|family)\b/i,
+  /\bmy\b.{0,40}\b(diet|allergy|allergic|food|eat|drink|vegetarian|vegan|gluten)\b/i,
+  /\bmy\b.{0,40}\b(job|work|role|company|employer|colleague|boss|team|project|task)\b/i,
+  /\bmy\b.{0,40}\b(address|home|city|country|location|timezone|office)\b/i,
+  /\bmy\b.{0,40}\b(preference|favourite|favorite|like|dislike|prefer|usual|order)\b/i,
+  /\bmy\b.{0,40}\b(schedule|appointment|meeting|routine|habit|morning|evening)\b/i,
+  /\bmy\b.{0,40}\b(goal|plan|todo|task|reminder|deadline)\b/i,
+  /\bmy\b.{0,40}\b(account|subscription|plan|billing)\b/i,
+  // Conversational triggers for past knowledge
+  /\b(do you (know|remember)|what('s| is) my|tell me (about )?my|what do (you know|I have)|remind me)\b/i,
+  /\b(last time|as usual|like before|same as|the usual)\b/i,
+  /\b(remember when|you (said|told me|mentioned)|didn'?t (you|we))\b/i,
+  // "what's X" patterns for personal things
+  /\bwhat'?s?\s+(my|the name|their name)\b/i,
+];
+
+/**
+ * Returns true if the message likely needs a mid-turn memory lookup.
+ * Also returns a focused query string to use for the recall.
+ */
+function detectPersonalContextSignal(message: string): { needed: boolean; query: string } {
+  // Strip very short messages — not worth the API call
+  if (message.trim().length < 8) return { needed: false, query: "" };
+
+  for (const pattern of PERSONAL_CONTEXT_PATTERNS) {
+    if (pattern.test(message)) {
+      // Use the message itself as the recall query — it's already specific
+      return { needed: true, query: message.trim().slice(0, 300) };
+    }
+  }
+
+  return { needed: false, query: "" };
+}
+
 // ── Recent message buffer for ingest ──────────────────
 
 // Store the last user message and session key per session for pairing
@@ -232,6 +278,7 @@ export default function register(api: any) {
   const configuredAgentId = pluginConfig.agentId; // fallback agent id from config
   const autoIngest = pluginConfig.autoIngest !== false;
   const autoRecall = pluginConfig.autoRecall !== false;
+  const midTurnRecall = pluginConfig.midTurnRecall !== false;
 
   api.logger?.info?.(
     `[d33pmemory] Plugin loaded. autoIngest=${autoIngest}, autoRecall=${autoRecall}, agentId=${configuredAgentId || "derived from session"}`
@@ -390,6 +437,92 @@ export default function register(api: any) {
         name: "d33pmemory.auto-recall",
         description:
           "Automatically recalls relevant memories and injects them into agent context on session start",
+      }
+    );
+  }
+
+  // ── Hook: before_agent_start — mid-turn recall ───────
+  //
+  // Fires before every agent turn. If the incoming message contains
+  // personal-context signals, runs a targeted recall and injects
+  // the results as a fresh context block.
+  //
+  // This supplements (not replaces) the session-start bootstrap recall.
+  // Bootstrap = broad "who is this user" snapshot.
+  // Mid-turn = focused "what do I know about what they're asking right now".
+
+  if (midTurnRecall) {
+    api.registerHook(
+      "before_agent_start",
+      async (event: Record<string, unknown>) => {
+        try {
+          // Extract the incoming user message
+          const inboundMessage =
+            (event.inboundMessage as string | undefined) ||
+            (event.message as string | undefined) ||
+            "";
+
+          if (!inboundMessage) return;
+
+          const { needed, query } = detectPersonalContextSignal(inboundMessage);
+          if (!needed) return;
+
+          const sessionKey = event.sessionKey as string | undefined;
+          const agentId = sessionKey
+            ? resolveAgentId(configuredAgentId, sessionKey)
+            : configuredAgentId;
+
+          const maxResults = pluginConfig.midTurnRecallMaxResults || 5;
+
+          const result = await client.recall(
+            query,
+            agentId,
+            maxResults,
+            pluginConfig.recallMinConfidence || 0.3
+          );
+
+          if (result.memories.length === 0) return;
+
+          // Format and inject as a fresh context block
+          const lines = result.memories.map((m) => {
+            const conf = Math.round(m.confidence * 100);
+            const src = m.source === "stated" ? "stated" : "inferred";
+            const agent = m.contributed_by ? ` (via ${m.contributed_by})` : "";
+            return `- [${m.type}/${src}/${conf}%] ${m.content}${agent}`;
+          });
+
+          const contextBlock = [
+            "## d33pmemory — Mid-turn recall",
+            "",
+            `The following memories are relevant to the user's current message: "${inboundMessage.slice(0, 100)}${inboundMessage.length > 100 ? "..." : ""}"`,
+            "Use them to answer accurately. Do not mention d33pmemory or this system to the user.",
+            "",
+            ...lines,
+            "",
+          ].join("\n");
+
+          if (
+            event.context?.bootstrapFiles &&
+            Array.isArray((event.context as any).bootstrapFiles)
+          ) {
+            (event.context as any).bootstrapFiles.push({
+              path: "D33PMEMORY_MID_TURN.md",
+              content: contextBlock,
+            });
+          }
+
+          api.logger?.debug?.(
+            `[d33pmemory] Mid-turn recall: injected ${result.memories.length} memories for query="${query.slice(0, 60)}"`
+          );
+        } catch (err: any) {
+          // Non-fatal — log and continue
+          api.logger?.warn?.(`[d33pmemory] Mid-turn recall failed: ${err.message}`);
+        }
+      },
+      {
+        name: "d33pmemory.mid-turn-recall",
+        description:
+          "Runs a targeted memory recall before agent turns that contain personal-context signals",
       }
     );
   }

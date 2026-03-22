@@ -2,7 +2,7 @@
   "id": "d33pmemory",
   "name": "d33pmemory",
   "description": "Automatic memory ingest & recall via d33pmemory API. Agents remember everything without needing to be told.",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -52,6 +52,18 @@
         "type": "string",
         "description": "Source channel label for ingested interactions",
         "default": "openclaw"
+      },
+      "midTurnRecall": {
+        "type": "boolean",
+        "description": "Run a targeted recall before each agent turn when the message contains personal-context signals (e.g. 'what's my dog's name?'). Supplements the session-start recall.",
+        "default": true
+      },
+      "midTurnRecallMaxResults": {
+        "type": "number",
+        "description": "Max memories to inject on mid-turn recall",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20
       }
     },
     "required": ["apiKey"]
