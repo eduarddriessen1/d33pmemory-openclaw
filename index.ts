@@ -56,7 +56,7 @@ function createClient(config: PluginConfig) {
     body: Record<string, unknown>
   ): Promise<T> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), 60000);
     const res = await fetch(`${baseUrl}${path}`, {
       method: "POST",
       headers: {
