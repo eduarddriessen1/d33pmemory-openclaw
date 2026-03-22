@@ -1,20 +1,12 @@
 {
   "name": "d33pmemory",
-  "version": "0.2.0",
-  "description": "OpenClaw plugin for d33pmemory \u2014 automatic memory ingest & recall for AI agents",
+  "version": "0.3.0",
+  "description": "OpenClaw plugin for d33pmemory — automatic memory ingest & recall for AI agents",
   "type": "module",
   "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
+    "extensions": ["./index.ts"]
   },
-  "keywords": [
-    "openclaw",
-    "plugin",
-    "memory",
-    "d33pmemory",
-    "ai-agents"
-  ],
+  "keywords": ["openclaw", "plugin", "memory", "d33pmemory", "ai-agents"],
   "author": "Coincorp B.V.",
   "license": "MIT",
   "repository": {
