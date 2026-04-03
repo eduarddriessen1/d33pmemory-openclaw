@@ -1,5 +1,5 @@
 {
-  "name": "@d33pmemory/openclaw-plugin",
+  "name": "d33pmemory",
   "version": "0.6.0",
   "description": "OpenClaw plugin for d33pmemory \u2014 automatic memory ingest & recall for AI agents",
   "type": "module",
