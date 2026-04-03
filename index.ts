@@ -87,15 +87,15 @@ function createClient(config: PluginConfig) {
       customId?: string,
       metadata?: Record<string, string | number | boolean>
     ) {
-      return request<{
-        interaction_id: string;
-        memories_stored: number;
-        extracted_memories: Array<{
-          id: string;
-          type: string;
-          content: string;
-          confidence: number;
-        }>;
+      // API returns 202 + { job_id, status: "queued" } (async)
+      // Fire-and-forget — we don't poll for results
+      const result = await request<{
+        // New async response shape
+        job_id?: string;
+        status?: string;
+        // Legacy sync shape (old API versions) — kept for compatibility
+        interaction_id?: string;
+        memories_stored?: number;
       }>("/v1/ingest", {
         user_message: userMessage,
         agent_response: agentResponse,
@@ -104,6 +104,7 @@ function createClient(config: PluginConfig) {
         ...(customId ? { custom_id: customId } : {}),
         ...(metadata ? { metadata } : {}),
       });
+      return result;
     },
 
     async recall(
@@ -111,7 +112,8 @@ function createClient(config: PluginConfig) {
       agentId?: string,
       maxResults?: number,
       minConfidence?: number,
-      category?: string
+      category?: string,
+      trigger?: "bootstrap" | "mid_turn" | "manual"
     ) {
       return request<{
         memories: RecalledMemory[];
@@ -122,6 +124,7 @@ function createClient(config: PluginConfig) {
         max_results: maxResults || config.recallMaxResults || 10,
         min_confidence: minConfidence || config.recallMinConfidence || 0.3,
         ...(category ? { category } : {}),
+        trigger: trigger || "manual",
       });
     },
   };
@@ -239,24 +242,37 @@ function detectPersonalContextSignal(message: string): { needed: boolean; query:
   return { needed: false, query: "" };
 }
 
-// ── Recent message buffer for ingest ──────────────────
+// ── Per-session turn buffer ────────────────────────────
+//
+// Tracks which messages have already been ingested per session.
+// On agent_end we collect ALL turns since the last ingest checkpoint,
+// not just the final turn — this is the fix for issue #2.
+//
+// Map key: sessionKey
+// Map value: index of last ingested message in the messages array
 
-// Store the last user message and session key per session for pairing
-// with the agent's response on agent_end.
+const lastIngestedIndex = new Map<string, number>();
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-interface PendingTurn {
-  content: string;
-  timestamp: number;
+interface SessionMeta {
+  lastIndex: number;
+  lastSeen: number;
+}
+const sessionMeta = new Map<string, SessionMeta>();
+
+function getLastIngestedIndex(sessionKey: string): number {
+  return sessionMeta.get(sessionKey)?.lastIndex ?? -1;
 }
 
-const pendingTurns = new Map<string, PendingTurn>();
-const PENDING_TTL_MS = 10 * 60 * 1000; // 10 minutes
+function setLastIngestedIndex(sessionKey: string, index: number) {
+  sessionMeta.set(sessionKey, { lastIndex: index, lastSeen: Date.now() });
+}
 
-function cleanPending() {
+function cleanSessionMeta() {
   const now = Date.now();
-  for (const [key, val] of pendingTurns) {
-    if (now - val.timestamp > PENDING_TTL_MS) {
-      pendingTurns.delete(key);
+  for (const [key, val] of sessionMeta) {
+    if (now - val.lastSeen > SESSION_TTL_MS) {
+      sessionMeta.delete(key);
     }
   }
 }
@@ -285,17 +301,20 @@ export default function register(api: any) {
   );
 
   // ── Track sessionKey per turn ─────────────────────────
+  // Use a Map keyed by a turn ID to avoid shared mutable state
+  // across concurrent sessions.
+  const activeTurnSessions = new Map<string, string>(); // turnId → sessionKey
 
   if (autoIngest) {
-    // Use before_agent_start to capture the sessionKey before the agent runs.
-    // This is more reliable than trying to extract it from event.context
-    // in agent_end (which may not always be populated).
     api.on(
       "before_agent_start",
       (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
-        if (ctx.sessionKey) {
-          // Store sessionKey at the turn level; agent_end will use it
-          (api as any).__d33pmemory_sessionKey = ctx.sessionKey as string;
+        const sk = (ctx?.sessionKey || event?.sessionKey) as string | undefined;
+        if (sk) {
+          const turnId = (event?.turnId || event?.id || sk) as string;
+          activeTurnSessions.set(turnId, sk);
+          // Also keep the legacy global for tools that still need it
+          (api as any).__d33pmemory_sessionKey = sk;
         }
       }
     );
@@ -305,85 +324,103 @@ export default function register(api: any) {
     api.on("agent_end", (event: Record<string, unknown>) => {
       // Fire-and-forget: don't await so we never block the gateway
       (async () => { try {
-        // Guard: only capture on successful agent turns
         if (!event.success) return;
 
-        // Grab the sessionKey we captured on before_agent_start
         const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
-
-        // Extract messages — look for the standard message array
         const messages = event.messages as unknown[] | undefined;
         if (!Array.isArray(messages) || messages.length === 0) return;
 
-        // Get the last user turn and the last assistant turn
-        let lastUserContent = "";
-        let lastAssistantContent = "";
+        // ── Collect ALL new turns since last ingest ───────
+        // Find the checkpoint — last index we already ingested for this session
+        const checkpoint = sessionKey ? getLastIngestedIndex(sessionKey) : -1;
 
-        for (let i = messages.length - 1; i >= 0; i--) {
+        // Extract content from a message block
+        function extractContent(msg: Record<string, unknown>): string {
+          if (typeof msg.content === "string") return msg.content;
+          if (Array.isArray(msg.content)) {
+            return (msg.content as Record<string, unknown>[])
+              .filter((b) => b?.type === "text" && typeof b.text === "string")
+              .map((b) => b.text as string)
+              .join(" ")
+              .trim();
+          }
+          return "";
+        }
+
+        // Build list of new [user, assistant] pairs after the checkpoint
+        interface Turn { user: string; assistant: string }
+        const newTurns: Turn[] = [];
+        let pendingUser = "";
+        let newHighWaterMark = checkpoint;
+
+        for (let i = checkpoint + 1; i < messages.length; i++) {
           const msg = messages[i] as Record<string, unknown>;
           if (!msg || typeof msg !== "object") continue;
 
           const role = msg.role as string;
-          let content = "";
-
-          if (typeof msg.content === "string") {
-            content = msg.content;
-          } else if (Array.isArray(msg.content)) {
-            // Handle multimodal content blocks
-            for (const block of msg.content as Record<string, unknown>[]) {
-              if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
-                content += block.text + " ";
-              }
-            }
-            content = content.trim();
-          }
-
+          const content = extractContent(msg);
           if (!content) continue;
 
-          if (role === "assistant" && !lastAssistantContent) {
-            lastAssistantContent = content;
+          if (role === "user") {
+            pendingUser = content;
+          } else if (role === "assistant" && pendingUser) {
+            // Skip commands and very short messages
+            if (pendingUser.length >= 5 && !pendingUser.startsWith("/")) {
+              newTurns.push({ user: pendingUser, assistant: content });
+            }
+            pendingUser = "";
+            newHighWaterMark = i;
           }
-          if (role === "user" && !lastUserContent) {
-            lastUserContent = content;
-          }
-
-          if (lastUserContent && lastAssistantContent) break;
         }
 
-        // Skip system messages and very short messages
-        if (lastUserContent.length < 5) return;
-        if (lastUserContent.startsWith("/")) return;
-        if (lastAssistantContent.length < 2) return;
+        if (newTurns.length === 0) return;
 
-        // Resolve agent_id:
-        // - If config.agentId is set → use it (shared namespace across workspaces)
-        // - Otherwise → derive from session key workspace name (each workspace isolated)
         const agentId = sessionKey
           ? resolveAgentId(configuredAgentId, sessionKey)
           : configuredAgentId;
         const customId = sessionKey ? buildMemoryCustomId(sessionKey) : undefined;
 
-        const result = await client.ingest(
-          lastUserContent,
-          lastAssistantContent,
-          agentId,
-          undefined, // source — use config default
-          customId,
-          {
-            session_key: sessionKey || "unknown",
-            agent_id: agentId,
-            workspace: sessionKey ? deriveWorkspaceName(sessionKey) : "unknown",
-            ingested_via: "agent_end_hook",
-          }
+        // Ingest each new turn — fire and forget individually so
+        // one failure doesn't block the rest. All async.
+        let ingestCount = 0;
+        await Promise.allSettled(
+          newTurns.map(async (turn) => {
+            try {
+              await client.ingest(
+                turn.user,
+                turn.assistant,
+                agentId,
+                undefined,
+                customId,
+                {
+                  session_key: sessionKey || "unknown",
+                  agent_id: agentId,
+                  workspace: sessionKey ? deriveWorkspaceName(sessionKey) : "unknown",
+                  ingested_via: "agent_end_hook",
+                }
+              );
+              ingestCount++;
+            } catch {
+              // individual turn failure — swallow, rest continue
+            }
+          })
         );
 
-        if (result.memories_stored > 0) {
+        // Advance checkpoint so we don't re-ingest these turns next time
+        if (sessionKey && newHighWaterMark > checkpoint) {
+          setLastIngestedIndex(sessionKey, newHighWaterMark);
+        }
+
+        // Periodic cleanup of stale session metadata
+        if (Math.random() < 0.05) cleanSessionMeta();
+
+        if (ingestCount > 0) {
           api.logger?.debug?.(
-            `[d33pmemory] Ingested ${result.memories_stored} memories workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"} agent=${agentId}`
+            `[d33pmemory] Queued ${ingestCount} turn(s) for ingest — workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"} agent=${agentId}`
           );
         }
       } catch (err: any) {
-        api.logger?.warn?.(`[d33pmemory] Ingest failed: ${err.message}`);
+        api.logger?.warn?.(`[d33pmemory] Ingest hook failed: ${err.message}`);
       }
       })();
     });
@@ -409,7 +446,9 @@ export default function register(api: any) {
             query,
             agentId,
             pluginConfig.recallMaxResults || 10,
-            pluginConfig.recallMinConfidence || 0.3
+            pluginConfig.recallMinConfidence || 0.3,
+            undefined,
+            "bootstrap"
           );
 
           if (result.memories.length === 0) return;
@@ -478,7 +517,9 @@ export default function register(api: any) {
             query,
             agentId,
             maxResults,
-            pluginConfig.recallMinConfidence || 0.3
+            pluginConfig.recallMinConfidence || 0.3,
+            undefined,
+            "mid_turn"
           );
 
           if (result.memories.length === 0) return;
@@ -569,7 +610,8 @@ export default function register(api: any) {
           agentId,
           params.max_results || 5,
           pluginConfig.recallMinConfidence || 0.3,
-          params.category
+          params.category,
+          "manual"
         );
 
         if (result.memories.length === 0) {
