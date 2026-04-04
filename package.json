@@ -1,6 +1,6 @@
 {
   "name": "d33pmemory",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "OpenClaw plugin for d33pmemory \u2014 automatic memory ingest & recall for AI agents",
   "type": "module",
   "openclaw": {

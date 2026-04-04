@@ -439,14 +439,13 @@ export default function register(api: any) {
   if (autoRecall) {
     api.on(
       "before_agent_start",
-      async (event: Record<string, unknown>) => {
+      async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
         try {
-          const sessionKey = ((api as any).__d33pmemory_sessionKey as string | undefined) || (event.sessionKey as string | undefined);
+          const sessionKey = (ctx?.sessionKey as string | undefined) || ((api as any).__d33pmemory_sessionKey as string | undefined);
           // Only bootstrap once per session
           if (sessionKey && bootstrappedSessions.has(sessionKey)) return;
           if (sessionKey) bootstrappedSessions.set(sessionKey, Date.now());
 
-          const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
           const agentId = sessionKey
             ? resolveAgentId(configuredAgentId, sessionKey)
             : configuredAgentId;
@@ -488,9 +487,9 @@ export default function register(api: any) {
   if (midTurnRecall) {
     api.on(
       "before_agent_start",
-      async (event: Record<string, unknown>) => {
+      async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
         try {
-          const sessionKey = ((api as any).__d33pmemory_sessionKey as string | undefined) || (event.sessionKey as string | undefined);
+          const sessionKey = (ctx?.sessionKey as string | undefined) || ((api as any).__d33pmemory_sessionKey as string | undefined);
           // Skip first turn — bootstrap handles it (check if session was just bootstrapped)
           if (!sessionKey || !bootstrappedSessions.has(sessionKey)) return;
 
@@ -501,7 +500,6 @@ export default function register(api: any) {
           const { needed, query } = detectPersonalContextSignal(prompt);
           if (!needed) return;
 
-          const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
           const agentId = sessionKey
             ? resolveAgentId(configuredAgentId, sessionKey)
             : configuredAgentId;
