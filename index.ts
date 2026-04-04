@@ -425,11 +425,15 @@ export default function register(api: any) {
     });
   }
 
+  // ── Per-session bootstrap tracker ─────────────────────────────────────
+  // Track which sessions have already received bootstrap recall.
+  // Keys are sessionKeys, values are timestamps.
+  const bootstrappedSessions = new Map<string, number>();
+
   // ── Hook: before_agent_start (first turn only) — bootstrap recall ────
   //
   // OpenClaw fires before_agent_start with { prompt, messages }.
-  // On the very first turn (messages.length === 0) we do a broad recall
-  // and return it as prependContext so it appears in the system prompt.
+  // We track per-session whether bootstrap has already fired.
   // This replaces the non-existent "agent:bootstrap" hook.
 
   if (autoRecall) {
@@ -437,9 +441,10 @@ export default function register(api: any) {
       "before_agent_start",
       async (event: Record<string, unknown>) => {
         try {
-          const messages = event.messages as unknown[] | undefined;
-          // Only run on session start (no prior messages)
-          if (Array.isArray(messages) && messages.length > 0) return;
+          const sessionKey = ((api as any).__d33pmemory_sessionKey as string | undefined) || (event.sessionKey as string | undefined);
+          // Only bootstrap once per session
+          if (sessionKey && bootstrappedSessions.has(sessionKey)) return;
+          if (sessionKey) bootstrappedSessions.set(sessionKey, Date.now());
 
           const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
           const agentId = sessionKey
@@ -485,9 +490,9 @@ export default function register(api: any) {
       "before_agent_start",
       async (event: Record<string, unknown>) => {
         try {
-          const messages = event.messages as unknown[] | undefined;
-          // Skip first turn — that's handled by bootstrap recall
-          if (!Array.isArray(messages) || messages.length === 0) return;
+          const sessionKey = ((api as any).__d33pmemory_sessionKey as string | undefined) || (event.sessionKey as string | undefined);
+          // Skip first turn — bootstrap handles it (check if session was just bootstrapped)
+          if (!sessionKey || !bootstrappedSessions.has(sessionKey)) return;
 
           // `prompt` is the current user message
           const prompt = (event.prompt as string | undefined) || "";
