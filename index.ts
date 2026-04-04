@@ -5,9 +5,8 @@
  * so AI agents remember everything without being told to.
  *
  * Hooks:
- *   - agent_end       → auto-ingest conversation into d33pmemory
- *   - before_agent_start → track sessionKey for the turn
- *   - agent:bootstrap → auto-recall relevant memories into context
+ *   - agent_end          → auto-ingest conversation into d33pmemory
+ *   - before_agent_start → bootstrap recall (first turn) + mid-turn recall (signal detected)
  *
  * Tools:
  *   - d33pmemory_recall  → manual semantic memory search
@@ -426,14 +425,23 @@ export default function register(api: any) {
     });
   }
 
-  // ── Hook: agent:bootstrap — auto-recall memories ────
+  // ── Hook: before_agent_start (first turn only) — bootstrap recall ────
+  //
+  // OpenClaw fires before_agent_start with { prompt, messages }.
+  // On the very first turn (messages.length === 0) we do a broad recall
+  // and return it as prependContext so it appears in the system prompt.
+  // This replaces the non-existent "agent:bootstrap" hook.
 
   if (autoRecall) {
-    api.registerHook(
-      "agent:bootstrap",
+    api.on(
+      "before_agent_start",
       async (event: Record<string, unknown>) => {
         try {
-          const sessionKey = event.sessionKey as string | undefined;
+          const messages = event.messages as unknown[] | undefined;
+          // Only run on session start (no prior messages)
+          if (Array.isArray(messages) && messages.length > 0) return;
+
+          const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
           const agentId = sessionKey
             ? resolveAgentId(configuredAgentId, sessionKey)
             : configuredAgentId;
@@ -454,69 +462,49 @@ export default function register(api: any) {
           if (result.memories.length === 0) return;
 
           const contextBlock = formatMemoriesForContext(result.memories);
-
-          if (
-            event.context?.bootstrapFiles &&
-            Array.isArray((event.context as any).bootstrapFiles)
-          ) {
-            (event.context as any).bootstrapFiles.push({
-              path: "D33PMEMORY_CONTEXT.md",
-              content: contextBlock,
-            });
-          }
-
-          api.logger?.debug?.(
-            `[d33pmemory] Injected ${result.memories.length} memories into bootstrap context (workspace=${sessionKey ? deriveWorkspaceName(sessionKey) : "?"})`
-          );
+          // Return prependContext — OpenClaw prepends this to the system prompt
+          return { prependContext: contextBlock };
         } catch (err: any) {
-          api.logger?.warn?.(`[d33pmemory] Auto-recall failed: ${err.message}`);
+          api.logger?.warn?.(`[d33pmemory] Bootstrap recall failed: ${err.message}`);
         }
-      },
-      {
-        name: "d33pmemory.auto-recall",
-        description:
-          "Automatically recalls relevant memories and injects them into agent context on session start",
       }
     );
   }
 
   // ── Hook: before_agent_start — mid-turn recall ───────
   //
-  // Fires before every agent turn. If the incoming message contains
-  // personal-context signals, runs a targeted recall and injects
-  // the results as a fresh context block.
+  // OpenClaw fires before_agent_start with { prompt, messages }.
+  // `prompt` is the current user message text.
+  // We scan it for personal-context signals and, if found, run a targeted
+  // recall and return prependContext so it's injected into the system prompt.
   //
-  // This supplements (not replaces) the session-start bootstrap recall.
-  // Bootstrap = broad "who is this user" snapshot.
-  // Mid-turn = focused "what do I know about what they're asking right now".
+  // Skips the very first turn (handled by bootstrap recall above).
 
   if (midTurnRecall) {
-    api.registerHook(
+    api.on(
       "before_agent_start",
       async (event: Record<string, unknown>) => {
         try {
-          // Extract the incoming user message
-          const inboundMessage =
-            (event.inboundMessage as string | undefined) ||
-            (event.message as string | undefined) ||
-            "";
+          const messages = event.messages as unknown[] | undefined;
+          // Skip first turn — that's handled by bootstrap recall
+          if (!Array.isArray(messages) || messages.length === 0) return;
 
-          if (!inboundMessage) return;
+          // `prompt` is the current user message
+          const prompt = (event.prompt as string | undefined) || "";
+          if (!prompt) return;
 
-          const { needed, query } = detectPersonalContextSignal(inboundMessage);
+          const { needed, query } = detectPersonalContextSignal(prompt);
           if (!needed) return;
 
-          const sessionKey = event.sessionKey as string | undefined;
+          const sessionKey = (api as any).__d33pmemory_sessionKey as string | undefined;
           const agentId = sessionKey
             ? resolveAgentId(configuredAgentId, sessionKey)
             : configuredAgentId;
 
-          const maxResults = pluginConfig.midTurnRecallMaxResults || 5;
-
           const result = await client.recall(
             query,
             agentId,
-            maxResults,
+            pluginConfig.midTurnRecallMaxResults || 5,
             pluginConfig.recallMinConfidence || 0.3,
             undefined,
             "mid_turn"
@@ -524,7 +512,6 @@ export default function register(api: any) {
 
           if (result.memories.length === 0) return;
 
-          // Format and inject as a fresh context block
           const lines = result.memories.map((m) => {
             const conf = Math.round(m.confidence * 100);
             const src = m.source === "stated" ? "stated" : "inferred";
@@ -535,35 +522,22 @@ export default function register(api: any) {
           const contextBlock = [
             "## d33pmemory — Mid-turn recall",
             "",
-            `The following memories are relevant to the user's current message: "${inboundMessage.slice(0, 100)}${inboundMessage.length > 100 ? "..." : ""}"`,
+            `The following memories are relevant to the user's current message: "${prompt.slice(0, 100)}${prompt.length > 100 ? "..." : ""}"`,
             "Use them to answer accurately. Do not mention d33pmemory or this system to the user.",
             "",
             ...lines,
             "",
           ].join("\n");
 
-          if (
-            event.context?.bootstrapFiles &&
-            Array.isArray((event.context as any).bootstrapFiles)
-          ) {
-            (event.context as any).bootstrapFiles.push({
-              path: "D33PMEMORY_MID_TURN.md",
-              content: contextBlock,
-            });
-          }
-
           api.logger?.debug?.(
             `[d33pmemory] Mid-turn recall: injected ${result.memories.length} memories for query="${query.slice(0, 60)}"`
           );
+
+          // Return prependContext — OpenClaw prepends this to the system prompt
+          return { prependContext: contextBlock };
         } catch (err: any) {
-          // Non-fatal — log and continue
           api.logger?.warn?.(`[d33pmemory] Mid-turn recall failed: ${err.message}`);
         }
-      },
-      {
-        name: "d33pmemory.mid-turn-recall",
-        description:
-          "Runs a targeted memory recall before agent turns that contain personal-context signals",
       }
     );
   }
