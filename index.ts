@@ -197,6 +197,22 @@ function formatMemoriesForContext(memories: RecalledMemory[]): string {
   ].join("\n");
 }
 
+// ── Strip OpenClaw inbound metadata envelope ──────────
+//
+// OpenClaw prepends a metadata block to every inbound message:
+//   Conversation info (untrusted metadata):\n```json\n{...}\n```\n\nSender...
+// We strip this so signal detection and recall queries only see the real message.
+
+function stripInboundMeta(prompt: string): string {
+  // Remove the standard OpenClaw metadata prefix blocks (Conversation info + Sender blocks)
+  // Pattern: one or more blocks of "Some label (untrusted metadata):\n```json\n...\n```"
+  // followed by optional whitespace, then the actual message
+  const stripped = prompt
+    .replace(/^(?:[\w\s]+\(untrusted metadata\):\n```json\n[\s\S]*?```\n\n?)+/m, "")
+    .trim();
+  return stripped || prompt;
+}
+
 // ── Personal Context Signal Detection ────────────────
 //
 // Detects whether an incoming message likely needs personal context
@@ -493,9 +509,10 @@ export default function register(api: any) {
           // Skip first turn — bootstrap handles it (check if session was just bootstrapped)
           if (!sessionKey || !bootstrappedSessions.has(sessionKey)) return;
 
-          // `prompt` is the current user message
-          const prompt = (event.prompt as string | undefined) || "";
-          if (!prompt) return;
+          // `prompt` is the current user message — strip OpenClaw metadata envelope first
+          const rawPrompt = (event.prompt as string | undefined) || "";
+          if (!rawPrompt) return;
+          const prompt = stripInboundMeta(rawPrompt);
 
           const { needed, query } = detectPersonalContextSignal(prompt);
           if (!needed) return;
