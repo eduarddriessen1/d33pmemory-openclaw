@@ -222,7 +222,7 @@ function stripInboundMeta(prompt: string): string {
 // (an extra API call), false negatives are expensive (wrong answer).
 
 const PERSONAL_CONTEXT_PATTERNS = [
-  // Direct questions about the user's own info
+  // Direct "my X" references
   /\bmy\b.{0,40}\b(name|dog|cat|pet|partner|wife|husband|girlfriend|boyfriend|kid|child|children|son|daughter|parent|mom|dad|brother|sister|family)\b/i,
   /\bmy\b.{0,40}\b(diet|allergy|allergic|food|eat|drink|vegetarian|vegan|gluten)\b/i,
   /\bmy\b.{0,40}\b(job|work|role|company|employer|colleague|boss|team|project|task)\b/i,
@@ -231,6 +231,26 @@ const PERSONAL_CONTEXT_PATTERNS = [
   /\bmy\b.{0,40}\b(schedule|appointment|meeting|routine|habit|morning|evening)\b/i,
   /\bmy\b.{0,40}\b(goal|plan|todo|task|reminder|deadline)\b/i,
   /\bmy\b.{0,40}\b(account|subscription|plan|billing)\b/i,
+  // "Do I / Am I / Have I" — implicit self-questions
+  /\bdo I\b.{0,60}\b(have|like|eat|drink|use|know|work|live|own|take|need|want)\b/i,
+  /\bam I\b.{0,40}\b(vegetarian|vegan|allergic|subscribed|on|a |the )\b/i,
+  /\bhave I\b.{0,40}\b(mentioned|told|said|shared|set|added|got|been)\b/i,
+  // "Where is/do" — location/context questions
+  /\bwhere (is|are|do|did) (my|I)\b/i,
+  // "What have I / What are my / What was my / What were my"
+  /\bwhat (have|had) I\b/i,
+  /\bwhat (are|were|was|is) my\b/i,
+  // "What have you / Is there anything about my"
+  /\bwhat do you (know|remember|have) (about )?(me|my)\b/i,
+  /\b(is|are) there (anything|something).{0,30}\bmy\b/i,
+  // "When is/do" — schedule/time questions
+  /\bwhen (is|are|do|did|was) (my|I)\b/i,
+  // "Who is my"
+  /\bwho (is|are|was|were) my\b/i,
+  // "Which X do I"
+  /\bwhich.{0,30}\bdo I\b/i,
+  // "How do I usually / How do I like"
+  /\bhow do I\b.{0,40}\b(usually|normally|like|take|prefer|use|handle)\b/i,
   // Conversational triggers for past knowledge
   /\b(do you (know|remember)|what('s| is) my|tell me (about )?my|what do (you know|I have)|remind me)\b/i,
   /\b(last time|as usual|like before|same as|the usual)\b/i,
